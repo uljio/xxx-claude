@@ -13,8 +13,8 @@ strategy(
   pyramiding = 0,
   default_qty_type = strategy.percent_of_equity,
   default_qty_value = 10,
-  calc_on_every_tick = false,
-  process_orders_on_close = true)
+  calc_on_every_tick = true,
+  process_orders_on_close = false)
 
 // === INPUTS ===
 res = input.timeframe('Chart', 'TIMEFRAME', group = "NON REPAINT", tooltip = "'Chart' uses chart timeframe * multiplier")
@@ -31,6 +31,9 @@ h = input(false, 'Signals for Heikin Ashi Candles', group = "TRADE SETTINGS", to
 
 // Additional entry control
 minBarsBetweenEntries = input.int(3, 'Minimum Bars Between Re-entries', minval = 1, maxval = 50, group = "NON REPAINT", tooltip = "Prevents rapid-fire entries - increase for calmer trading")
+
+// HTF signal mode selection
+htfSignalMode = input.string('HTF_AS_FILTER', 'HTF Signal Mode', options = ['HTF_AS_FILTER', 'HTF_AS_SIGNAL'], group = "NON REPAINT", tooltip = "HTF_AS_FILTER: Fast LTF entries with HTF trend confirmation (RECOMMENDED). HTF_AS_SIGNAL: Wait for HTF crossover (slower, original behavior)")
 
 // Additional filters
 useTrendFilter = input.bool(true, 'Use Trend Filter (EMA200)', group = "FILTERS")
@@ -219,6 +222,19 @@ useLookahead = entryMode == 'AGGRESSIVE' ? barmerge.lookahead_on :
 closeSeriesHTF = useRes ? request.security(syminfo.tickerid, stratRes, closeSeries, lookahead = useLookahead, gaps = barmerge.gaps_off) : closeSeries
 openSeriesHTF = useRes ? request.security(syminfo.tickerid, stratRes, openSeries, lookahead = useLookahead, gaps = barmerge.gaps_off) : openSeries
 
+// ===== LTF SIGNAL CALCULATION (for HTF_AS_FILTER mode) =====
+// Calculate MAs on chart timeframe (not HTF) for faster signal detection
+closeLTF = variant(basisType, src[delayOffset], basisLen, offsetSigma, offsetALMA)
+openLTF = variant(basisType, srcOpen[delayOffset], basisLen, offsetSigma, offsetALMA)
+
+// Detect LTF crossovers (fast signals)
+bullCrossLTF = ta.crossover(closeLTF, openLTF)
+bearCrossLTF = ta.crossunder(closeLTF, openLTF)
+
+// HTF trend state (not waiting for crossover, just checking current direction)
+htfTrendBullish = closeSeriesHTF > openSeriesHTF
+htfTrendBearish = closeSeriesHTF < openSeriesHTF
+
 // For BALANCED mode: Use barstate.isconfirmed to wait for HTF close
 htfConfirmed = useRes and entryMode == 'BALANCED' ? request.security(syminfo.tickerid, stratRes, barstate.isconfirmed, lookahead = barmerge.lookahead_on, gaps = barmerge.gaps_off) : true
 
@@ -245,16 +261,36 @@ if bullCross
 barsSinceLastEntry = bar_index - lastEntryBar
 entryCooldownOK = barsSinceLastEntry >= minBarsBetweenEntries or lastEntryBar == 0
 
-// Allow entry if: NEW crossover OR same signal but no position AND cooldown passed
-leTriggerCross = bullCross and entryCooldownOK
-leTriggerReentry = bullSignal and not inBullSignal and strategy.position_size == 0 and entryCooldownOK
+// Entry triggers - depends on HTF signal mode
+var float leTriggerCross = na
+var float leTriggerReentry = na
+var float seTriggerCross = na
+var float seTriggerReentry = na
+var float leTrigger = na
+var float seTrigger = na
 
-seTriggerCross = bearCross and entryCooldownOK
-seTriggerReentry = bearSignal and not inBearSignal and strategy.position_size == 0 and entryCooldownOK
+if htfSignalMode == 'HTF_AS_FILTER'
+    // NEW MODE: LTF crossover with HTF trend confirmation (FAST)
+    leTriggerCross := bullCrossLTF and htfTrendBullish and entryCooldownOK
+    leTriggerReentry := closeLTF > openLTF and htfTrendBullish and not inBullSignal and strategy.position_size == 0 and entryCooldownOK
 
-// Apply HTF confirmation based on mode
-leTrigger = entryMode == 'BALANCED' ? ((leTriggerCross or leTriggerReentry) and htfConfirmed) : (leTriggerCross or leTriggerReentry)
-seTrigger = entryMode == 'BALANCED' ? ((seTriggerCross or seTriggerReentry) and htfConfirmed) : (seTriggerCross or seTriggerReentry)
+    seTriggerCross := bearCrossLTF and htfTrendBearish and entryCooldownOK
+    seTriggerReentry := closeLTF < openLTF and htfTrendBearish and not inBearSignal and strategy.position_size == 0 and entryCooldownOK
+
+    // No HTF confirmation needed - already using HTF as filter
+    leTrigger := leTriggerCross or leTriggerReentry
+    seTrigger := seTriggerCross or seTriggerReentry
+else
+    // ORIGINAL MODE: HTF crossover signals (SLOW but original behavior)
+    leTriggerCross := bullCross and entryCooldownOK
+    leTriggerReentry := bullSignal and not inBullSignal and strategy.position_size == 0 and entryCooldownOK
+
+    seTriggerCross := bearCross and entryCooldownOK
+    seTriggerReentry := bearSignal and not inBearSignal and strategy.position_size == 0 and entryCooldownOK
+
+    // Apply HTF confirmation based on mode
+    leTrigger := entryMode == 'BALANCED' ? ((leTriggerCross or leTriggerReentry) and htfConfirmed) : (leTriggerCross or leTriggerReentry)
+    seTrigger := entryMode == 'BALANCED' ? ((seTriggerCross or seTriggerReentry) and htfConfirmed) : (seTriggerCross or seTriggerReentry)
 
 // Additional filters
 ema200 = ta.ema(close, 200)
@@ -505,63 +541,67 @@ plotshape(i_alertOn and sxTrigger and strategy.position_size < 0, 'Short Exit Si
 barcolor(i_barColOn and strategy.position_size > 0 ? color.new(color.green, 70) : i_barColOn and strategy.position_size < 0 ? color.new(color.red, 70) : na)
 
 // Enhanced debug table with DIAGNOSTIC INFO
-var table debugTable = table.new(position.top_right, 2, 12, bgcolor = color.new(color.black, 85), border_width = 1)
+var table debugTable = table.new(position.top_right, 2, 13, bgcolor = color.new(color.black, 85), border_width = 1)
 if barstate.islast
     table.cell(debugTable, 0, 0, "MODE", text_color = color.white, text_size = size.small)
     table.cell(debugTable, 1, 0, entryMode, text_color = color.yellow, text_size = size.small)
     
     table.cell(debugTable, 0, 1, "HTF", text_color = color.white, text_size = size.small)
     table.cell(debugTable, 1, 1, useRes ? stratRes : "CHART", text_color = color.aqua, text_size = size.small)
-    
+
+    table.cell(debugTable, 0, 2, "HTF Mode", text_color = color.white, text_size = size.small)
+    htfModeDisplay = htfSignalMode == 'HTF_AS_FILTER' ? "FILTER⚡" : "SIGNAL🐌"
+    table.cell(debugTable, 1, 2, htfModeDisplay, text_color = htfSignalMode == 'HTF_AS_FILTER' ? color.lime : color.orange, text_size = size.small)
+
     // Warning for low multiplier with BALANCED mode
-    if entryMode == 'BALANCED' and intRes < 4 and res == 'Chart'
-        table.cell(debugTable, 0, 2, "⚠ WARNING", text_color = color.white, text_size = size.small, bgcolor = color.new(color.red, 70))
-        table.cell(debugTable, 1, 2, "Use 4x+ or AGGRESSIVE", text_color = color.orange, text_size = size.tiny, bgcolor = color.new(color.red, 70))
+    if entryMode == 'BALANCED' and intRes < 4 and res == 'Chart' and htfSignalMode == 'HTF_AS_SIGNAL'
+        table.cell(debugTable, 0, 3, "⚠ WARNING", text_color = color.white, text_size = size.small, bgcolor = color.new(color.red, 70))
+        table.cell(debugTable, 1, 3, "Use 4x+ or AGGRESSIVE", text_color = color.orange, text_size = size.tiny, bgcolor = color.new(color.red, 70))
     else
-        table.cell(debugTable, 0, 2, "Signal", text_color = color.white, text_size = size.small)
+        table.cell(debugTable, 0, 3, "Signal", text_color = color.white, text_size = size.small)
         signalText = closeSeriesHTF > openSeriesHTF ? "BULLISH" : closeSeriesHTF < openSeriesHTF ? "BEARISH" : "NEUTRAL"
         signalColor = closeSeriesHTF > openSeriesHTF ? color.green : closeSeriesHTF < openSeriesHTF ? color.red : color.gray
-        table.cell(debugTable, 1, 2, signalText, text_color = signalColor, text_size = size.small)
-    
-    table.cell(debugTable, 0, 3, "Position", text_color = color.white, text_size = size.small)
-    table.cell(debugTable, 1, 3, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT", 
+        table.cell(debugTable, 1, 3, signalText, text_color = signalColor, text_size = size.small)
+
+    table.cell(debugTable, 0, 4, "Position", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 4, strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT",
                text_color = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray, text_size = size.small)
-    
-    table.cell(debugTable, 0, 4, "Entry", text_color = color.white, text_size = size.small)
-    table.cell(debugTable, 1, 4, not na(actualEntryPrice) ? str.tostring(actualEntryPrice, format.mintick) : "N/A", 
+
+    table.cell(debugTable, 0, 5, "Entry", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 5, not na(actualEntryPrice) ? str.tostring(actualEntryPrice, format.mintick) : "N/A",
                text_color = color.blue, text_size = size.small)
-    
-    table.cell(debugTable, 0, 5, "Cooldown", text_color = color.white, text_size = size.small)
-    table.cell(debugTable, 1, 5, str.tostring(barsSinceLastEntry) + "/" + str.tostring(minBarsBetweenEntries), 
+
+    table.cell(debugTable, 0, 6, "Cooldown", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 6, str.tostring(barsSinceLastEntry) + "/" + str.tostring(minBarsBetweenEntries),
                text_color = entryCooldownOK ? color.green : color.orange, text_size = size.small)
-    
+
     // DIAGNOSTIC: Show individual filter states
-    table.cell(debugTable, 0, 6, "Trend OK?", text_color = color.white, text_size = size.tiny)
+    table.cell(debugTable, 0, 7, "Trend OK?", text_color = color.white, text_size = size.tiny)
     trendOK = not useTrendFilter or trendFilter or trendFilterShort
-    table.cell(debugTable, 1, 6, useTrendFilter ? (trendOK ? "✓" : "✗") : "OFF", 
+    table.cell(debugTable, 1, 7, useTrendFilter ? (trendOK ? "✓" : "✗") : "OFF",
                text_color = trendOK ? color.green : color.red, text_size = size.small)
-    
-    table.cell(debugTable, 0, 7, "ATR OK?", text_color = color.white, text_size = size.tiny)
-    table.cell(debugTable, 1, 7, useATRFilter ? (atrFilter ? "✓" : "✗") : "OFF", 
+
+    table.cell(debugTable, 0, 8, "ATR OK?", text_color = color.white, text_size = size.tiny)
+    table.cell(debugTable, 1, 8, useATRFilter ? (atrFilter ? "✓" : "✗") : "OFF",
                text_color = atrFilter ? color.green : color.red, text_size = size.small)
-    
+
     // DIAGNOSTIC: Show entry trigger states
-    table.cell(debugTable, 0, 8, "Long Trigger", text_color = color.white, text_size = size.tiny)
-    table.cell(debugTable, 1, 8, longEntry ? "YES" : "NO", 
+    table.cell(debugTable, 0, 9, "Long Trigger", text_color = color.white, text_size = size.tiny)
+    table.cell(debugTable, 1, 9, longEntry ? "YES" : "NO",
                text_color = longEntry ? color.green : color.gray, text_size = size.tiny)
-    
-    table.cell(debugTable, 0, 9, "Short Trigger", text_color = color.white, text_size = size.tiny)
-    table.cell(debugTable, 1, 9, shortEntry ? "YES" : "NO", 
+
+    table.cell(debugTable, 0, 10, "Short Trigger", text_color = color.white, text_size = size.tiny)
+    table.cell(debugTable, 1, 10, shortEntry ? "YES" : "NO",
                text_color = shortEntry ? color.green : color.gray, text_size = size.tiny)
-    
+
     // DIAGNOSTIC: Show signal flags
-    table.cell(debugTable, 0, 10, "Bull/Bear Flags", text_color = color.white, text_size = size.tiny)
-    table.cell(debugTable, 1, 10, (inBullSignal ? "B" : "") + (inBearSignal ? "S" : "") + (not inBullSignal and not inBearSignal ? "NONE" : ""), 
+    table.cell(debugTable, 0, 11, "Bull/Bear Flags", text_color = color.white, text_size = size.tiny)
+    table.cell(debugTable, 1, 11, (inBullSignal ? "B" : "") + (inBearSignal ? "S" : "") + (not inBullSignal and not inBearSignal ? "NONE" : ""),
                text_color = color.yellow, text_size = size.tiny)
-    
-    table.cell(debugTable, 0, 11, "P&L", text_color = color.white, text_size = size.small)
+
+    table.cell(debugTable, 0, 12, "P&L", text_color = color.white, text_size = size.small)
     pnlPercent = strategy.netprofit / strategy.initial_capital * 100
-    table.cell(debugTable, 1, 11, str.tostring(pnlPercent, "#.##") + "%", 
+    table.cell(debugTable, 1, 12, str.tostring(pnlPercent, "#.##") + "%", 
                text_color = pnlPercent > 0 ? color.green : pnlPercent < 0 ? color.red : color.gray, text_size = size.small)
 
 // end of script
