@@ -262,12 +262,12 @@ barsSinceLastEntry = bar_index - lastEntryBar
 entryCooldownOK = barsSinceLastEntry >= minBarsBetweenEntries or lastEntryBar == 0
 
 // Entry triggers - depends on HTF signal mode
-var float leTriggerCross = na
-var float leTriggerReentry = na
-var float seTriggerCross = na
-var float seTriggerReentry = na
-var float leTrigger = na
-var float seTrigger = na
+var bool leTriggerCross = na
+var bool leTriggerReentry = na
+var bool seTriggerCross = na
+var bool seTriggerReentry = na
+var bool leTrigger = na
+var bool seTrigger = na
 
 if htfSignalMode == 'HTF_AS_FILTER'
     // NEW MODE: LTF crossover with HTF trend confirmation (FAST)
